@@ -40,6 +40,10 @@
           <span class="icon">+</span> 提问
         </button>
 
+        <button class="ask-button ai-open-button" type="button" @click="toggleAiAssistantPanel">
+          <span class="icon">AI</span> AI 助手
+        </button>
+
         <div class="action-icon-wrapper message-wrapper" @click="togglePrivateMessagePanel">
           <img
               src="/assets/icons/icon-private-message.svg"
@@ -87,6 +91,8 @@
             :initialNoteId="editingNoteId"
             @close="handleCloseEditor"
             @note-selected="handleNoteSelected"
+            @ai-context-updated="handleAiContextUpdated"
+            @open-ai-assistant="showAiAssistantPanel = true"
         />
       </section>
 
@@ -121,6 +127,7 @@
           :initialStats="noteDetailStats"
           :initialTitle="noteDetailTitle"
           @stats-updated="handleStatsUpdated"
+          @ai-context-updated="handleAiContextUpdated"
         />
       </section>
       <section v-else-if="currentTab === 'follow' && currentUserId">
@@ -135,6 +142,7 @@
           :answerId="route.query.answerId"
           :commentId="route.query.commentId"
           :replyId="route.query.replyId"
+          @ai-context-updated="handleAiContextUpdated"
         />
       </section>
       <section v-else-if="currentTab === 'workspace'">
@@ -214,6 +222,11 @@
       v-model:visible="showPrivateMessagePanel"
       @unread-updated="handleUnreadUpdated"
     />
+
+    <AiAssistantPanel
+      v-model:visible="showAiAssistantPanel"
+      :context="aiHostContext"
+    />
   </div>
 </template>
 
@@ -233,10 +246,12 @@ import QADetailView from '../components/user/QADetailView.vue'
 import FollowListView from '../components/user/FollowListView.vue'
 import UserNotesView from '../components/user/UserNotesView.vue'
 import PrivateMessagePanel from '../components/user/PrivateMessagePanel.vue'
+import AiAssistantPanel from '../components/agent/AiAssistantPanel.vue'
 import { useRouter, useRoute } from 'vue-router'
 import service from '../api/request'
 import { useUserStore } from '@/stores/user'
 import { storeToRefs } from 'pinia'
+import { buildAiHostSnapshot } from '@/utils/aiProtocol'
 import { fetchUnreadTotal as fetchConversationUnreadTotal } from '@/api/conversation'
 import {
   fetchNotifications,
@@ -260,11 +275,29 @@ const userAvatarUrl = computed(() => {
 
 // 当前用户ID
 const currentUserId = computed(() => userInfo.value?.id)
+const aiResourceContext = ref(null)
+
+const getAiPageMode = () => {
+  const resourceKind = String(aiResourceContext.value?.kind || '').toLowerCase()
+  if (currentTab.value === 'workspace' && (resourceKind === 'note-editor' || editingNotebookId.value || aiResourceContext.value?.status === 'editing')) {
+    return 'edit'
+  }
+
+  if (currentTab.value === 'note-detail' || currentTab.value === 'qa-detail') {
+    return 'view'
+  }
+
+  return 'browse'
+}
+
+const canAccessAiWriteActions = () => getAiPageMode() === 'edit'
 
 // 私信面板控制与未读数
 const showPrivateMessagePanel = ref(false)
 const privateMessageUnreadTotal = ref(0)
 let privateMessageTimer = null
+
+const showAiAssistantPanel = ref(localStorage.getItem('folio.ai.panel.open') === 'true')
 
 // 通知面板 & 未读数
 const showNotificationPanel = ref(false)
@@ -484,6 +517,23 @@ const tabs = [
   { value: 'circle', label: '问答', desc: 'Q&A' },
   { value: 'workspace', label: '我的笔记', desc: 'WorkspaceView' }
 ]
+
+const aiHostContext = computed(() => buildAiHostSnapshot({
+  route,
+  userInfo: userInfo.value,
+  currentTab: currentTab.value,
+  pageMode: getAiPageMode(),
+  searchKeyword: searchKeyword.value,
+  viewingNoteId: viewingNoteId.value,
+  selectedWorkspaceId: selectedWorkspaceId.value,
+  editingNotebookId: editingNotebookId.value,
+  editingSpaceId: editingSpaceId.value,
+  resource: aiResourceContext.value,
+  authToken: localStorage.getItem('token') || '',
+  permissions: {
+    canAccessWriteActions: canAccessAiWriteActions()
+  }
+}))
 
 // 搜索相关状态
 const searchKeyword = ref('')
@@ -810,6 +860,7 @@ const restoreEditorFromRoute = async (shouldSetTab = true) => {
 // 处理 WorkspaceView 发出的"打开笔记本"事件
 const handleOpenNotebook = (payload) => {
   if (payload && typeof payload.notebookId !== 'undefined') {
+    aiResourceContext.value = null
     editingNotebookId.value = payload.notebookId;
     editingSpaceId.value = payload.spaceId;
     editingNotebookName.value = payload.notebookName;
@@ -875,6 +926,7 @@ const handleCloseEditor = () => {
     selectedWorkspaceId.value = spaceIdBeforeClose
     newQuery.workspaceId = spaceIdBeforeClose
   }
+  aiResourceContext.value = null
   
   router.replace({
     path: route.path,
@@ -888,6 +940,7 @@ const handleCloseEditor = () => {
 // 处理 WorkspaceView 发出的"空间选中"事件
 const handleWorkspaceSelected = (workspaceId) => {
   selectedWorkspaceId.value = workspaceId
+  aiResourceContext.value = null
   
   // 将选中的空间ID保存到 URL（只在 workspace tab 时）
   if (currentTab.value === 'workspace') {
@@ -904,6 +957,11 @@ const handleWorkspaceSelected = (workspaceId) => {
 // 跳转到个人信息页面
 const goToProfile = () => {
   currentTab.value = 'profile'
+}
+
+const toggleAiAssistantPanel = () => {
+  showAiAssistantPanel.value = !showAiAssistantPanel.value
+  localStorage.setItem('folio.ai.panel.open', String(showAiAssistantPanel.value))
 }
 
 // 处理提问按钮，跳转问答并弹出提问框
@@ -945,6 +1003,15 @@ const handleOpenNoteDetail = (payload) => {
     
     // 保存标题（如果从搜索结果传递过来）
     noteDetailTitle.value = payload.title || null
+    aiResourceContext.value = {
+      kind: 'note-detail',
+      noteId: payload.noteId,
+      title: payload.title || null,
+      fileType: payload.fileType || null,
+      contentPreview: payload.contentSummary || payload.summary || '',
+      commentCount: payload.commentCount || 0,
+      updatedAt: payload.updatedAt || null
+    }
     
     // 保存统计信息（如果从搜索结果传递过来）
     if (payload.authorName !== undefined || payload.viewCount !== undefined) {
@@ -1039,6 +1106,21 @@ const handleStatsUpdated = (payload) => {
   }
 }
 
+const handleAiContextUpdated = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return
+  }
+
+  aiResourceContext.value = payload
+}
+
+watch(currentTab, (value) => {
+  const resourceTabs = new Set(['note-detail', 'workspace', 'qa-detail'])
+  if (!resourceTabs.has(value)) {
+    aiResourceContext.value = null
+  }
+})
+
 // 监听路由中的搜索关键词
 watch(() => route.query.keyword, (newKeyword) => {
   if (newKeyword) {
@@ -1123,6 +1205,10 @@ onBeforeUnmount(() => {
     clearInterval(notificationTimer)
     notificationTimer = null
   }
+})
+
+watch(showAiAssistantPanel, (value) => {
+  localStorage.setItem('folio.ai.panel.open', String(value))
 })
 
 // --- 结束新增 ---
